@@ -262,7 +262,7 @@ declare function probeModel(options: {
 /** WorkBuddy region selected by the credential's login domain. */
 type WorkBuddyRegion = 'cn' | 'global';
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
-type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client';
+type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client' | 'channel_reject';
 /** One CLI-usable model as the upstream catalog describes it. */
 interface WorkBuddyUpstreamModel {
   id: string;
@@ -449,13 +449,19 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, and move a recognized third-party
+ * agent system prompt off the gateway's content fingerprint.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
  * upstream rejects that role with HTTP 400 code 11128 ("Illegal API
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
+ *
+ * The channel-fingerprint rewrite is load-bearing for the same reason, one
+ * layer down: the gateway also scans the START of every `system` message for a
+ * list of known third-party-agent prompt openings and refuses a hit with the
+ * same 11128. See {@link neutralizeChannelFingerprints}.
  */
 declare function prepareChatBody(source: string): string;
 /** Provenance of one successful catalog fetch, surfaced by the status card. */
@@ -680,14 +686,26 @@ declare function modelWithCurrentPromotion(model: WorkBuddyUpstreamModel, now?: 
 /**
  * Prepare a body for the **CN** endpoint.
  *
- * Until #87 the CN wire was the caller's body verbatim. The only difference
- * now is the shared {@link dropUnsupportedEffort} strip, whose region scope was
- * lifted once measurements showed this endpoint rejects `off` too.
+ * Until #87 the CN wire was the caller's body verbatim. The difference now is
+ * the shared {@link dropUnsupportedEffort} strip, whose region scope was lifted
+ * once measurements showed this endpoint rejects `off` too, plus the channel
+ * fingerprint neutralisation (issue #144).
  *
  * Deliberately **not** routed through {@link prepareChatBody}: the shim already
  * applies it before handing the body to {@link WorkBuddyUpstreamClient.chatStream},
  * and re-running it would be a second `stream`/`developer`/`tool_choice`
- * normalisation of an already-normalised body. Only the strip belongs here.
+ * normalisation of an already-normalised body. Only the region-specific steps
+ * belong here.
+ *
+ * The two rewrites this path DOES apply are the ones that decide whether the
+ * CN gateway answers at all, and both are idempotent, so running them on an
+ * already-prepared body changes nothing:
+ *
+ * - {@link normalizeDeveloperRole} — the CN endpoint rejects a `developer`
+ *   role with the same 11128 the channel gate uses.
+ * - {@link neutralizeChannelFingerprints} — the CN endpoint refuses a system
+ *   message whose OPENING matches a known third-party-agent prompt, which is
+ *   exactly the host's own prompt (measured: 400 / 11128 on the real gateway).
  *
  * A body that is not a JSON object is returned unchanged, so this is safe to
  * run over an already-prepared-or-not body.

@@ -21,7 +21,7 @@ import { Readable } from 'node:stream'
 import type { WorkBuddyCredentialStore } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { bindToUsablePort, hostIsLoopback, originIsLoopback } from './loopback.ts'
-import { extractDisplayErrorMessage, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import { extractDisplayErrorMessage, prepareChatBody, systemOpeningsOfBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
 
 /** Minimal logger surface the plugin context already provides. */
 export interface ShimLogger {
@@ -70,6 +70,31 @@ const KIND_STATUS: Readonly<Record<UpstreamErrorKind, number>> = {
   not_found: 502,
   server: 502,
   client: 400,
+  // The channel gate is a request-shape refusal, not a server fault: the
+  // upstream answered 400, and the host reads 400 as INVALID_REQUEST, which
+  // is exactly right — retrying the same prompt would send the same bytes.
+  channel_reject: 400,
+}
+
+/**
+ * The evidence line appended to a channel-reject message.
+ *
+ * The upstream's own wording for this gate blames the client — "可能不是官方
+ * 客户端发出的" ("this call did not come from the official client") — which is
+ * misleading: the gate matched the START of a system message against a list of
+ * known third-party-agent prompt openings, and it has nothing to do with the
+ * account, the credit balance, the network, or the User-Agent. Echoing the
+ * opening that was actually sent turns the message into something actionable
+ * instead of sending the reader off to change accounts.
+ *
+ * Empty when the body carries no readable system opening — the conclusion
+ * still stands without it, and inventing one would be worse than omitting it.
+ */
+function channelRejectEvidence(preparedBody: string): string {
+  const openings = systemOpeningsOfBody(preparedBody)
+  if (openings.length === 0) return ''
+  const quoted = openings.map((opening) => `「${opening}」`).join('、')
+  return ` 命中的 system 提示开头：${quoted}。该请求被 WorkBuddy 网关的渠道校验拦截（不是账号、额度或网络问题），换账号或换区域也不会改变结果。`
 }
 
 function writeJson(res: ServerResponse, status: number, body: unknown): void {
@@ -266,7 +291,7 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
         res,
         KIND_STATUS[result.kind],
         result.kind,
-        `workbuddy upstream ${result.kind}${statusNote}: ${detail}`,
+        `workbuddy upstream ${result.kind}${statusNote}: ${detail}${channelRejectEvidence(prepared)}`,
       )
       return
     }

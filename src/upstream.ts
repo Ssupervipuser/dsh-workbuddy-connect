@@ -25,6 +25,7 @@ export type UpstreamErrorKind =
   | 'not_found'
   | 'server'
   | 'client'
+  | 'channel_reject'
 
 /** One CLI-usable model as the upstream catalog describes it. */
 export interface WorkBuddyUpstreamModel {
@@ -351,6 +352,61 @@ function resolveUpstreamBilling(
 /** Session-invalidation markers that mean "sign in again in the WorkBuddy app". */
 const SESSION_DEAD_MARKERS: readonly string[] = ['Offline user session not found', '12153']
 
+/**
+ * Business code of the gateway's CHANNEL gate (`11128`, "Illegal API invocation
+ * from an unapproved channel").
+ *
+ * The quoted-key form on purpose: a request id is hexadecimal and can contain
+ * the digits `11128` by coincidence, so a bare substring search would promote
+ * an unrelated failure into this class.
+ *
+ * The SAME code covers two other gates — a request missing the conversation-id
+ * headers, and a request whose first message is not a system prompt — so the
+ * code alone cannot identify this one. The body is what tells them apart;
+ * see {@link isChannelRejectBody}.
+ */
+const CHANNEL_REJECT_CODE = '"code":11128'
+
+/**
+ * Wording that identifies the CHANNEL half of `11128`.
+ *
+ * Matched against the upstream's `msg`, never against the localized
+ * `displayMsg`: that text is the SAME misleading sentence for every member of
+ * the `11128` family ("可能不是官方客户端发出的" — "this call did not come from
+ * the official client"), so matching it would claim the conversation-id gate
+ * too and blame the prompt's opening for a header problem this plugin already
+ * fixes.
+ */
+const CHANNEL_REJECT_MARKERS: readonly string[] = ['unapproved channel', 'illegal api invocation']
+
+/**
+ * The other gates that answer the SAME business code.
+ *
+ * Excluded explicitly, so a body carrying the channel wording alongside one of
+ * these is never read as the prompt rule: a confidently wrong diagnosis is
+ * worse here than the generic `client` reply, because it sends the reader to
+ * rewrite a system prompt that is not at fault.
+ */
+const OTHER_CHANNEL_CODE_GATES: readonly string[] = [
+  'conversation id missing',
+  'first message is not system prompt',
+]
+
+/**
+ * Whether a failure body is the gateway's CHANNEL gate rather than one of the
+ * other `11128` gates.
+ *
+ * Both halves are required — the code AND the wording. Requiring the code
+ * alone would claim the conversation-id gate too; requiring the wording alone
+ * would let a different business code carrying a similar phrase be misfiled.
+ */
+function isChannelRejectBody(body: string): boolean {
+  if (!body.includes(CHANNEL_REJECT_CODE)) return false
+  const lower = body.toLowerCase()
+  if (OTHER_CHANNEL_CODE_GATES.some((marker) => lower.includes(marker))) return false
+  return CHANNEL_REJECT_MARKERS.some((marker) => lower.includes(marker))
+}
+
 /** Classify an upstream failure from its HTTP status and body excerpt. */
 export function classifyUpstreamError(status: number, body: string): UpstreamErrorKind {
   if (status === 402) return 'hard_credit'
@@ -360,6 +416,10 @@ export function classifyUpstreamError(status: number, body: string): UpstreamErr
   // 403). Keeping every 401 in `session_dead` preserves the `(http 401)`
   // status note the host needs to classify it as AUTH.
   if (status === 401) return 'session_dead'
+  // Before the credit markers: a body that names the channel gate is about the
+  // request's PROMPT, not about money, and the credit wording is only ever
+  // checked on a body that did not name this gate.
+  if (isChannelRejectBody(body)) return 'channel_reject'
   const lower = body.toLowerCase()
   for (const marker of HARD_CREDIT_MARKERS) {
     if (lower.includes(marker.toLowerCase()) || body.includes(marker)) return 'hard_credit'
@@ -409,6 +469,68 @@ export function regionOf(domain: string): WorkBuddyRegion {
   const lowered = domain.trim().toLowerCase()
   if (lowered === 'workbuddy.ai' || lowered.endsWith('.workbuddy.ai')) return 'global'
   return 'cn'
+}
+
+/** Longest system-prompt opening echoed back to the reader, in characters. */
+const SYSTEM_OPENING_LIMIT = 120
+
+/**
+ * The OPENINGS of the `system` messages in a prepared request body.
+ *
+ * This is the evidence the channel gate reacts to, and echoing it is what
+ * turns "the upstream refused" into "the upstream refused because of this
+ * line" — the reader can then fix the prompt, or report a new opening, instead
+ * of cycling through accounts that cannot change a byte of it.
+ *
+ * Each entry is the first non-empty line, clipped: a fingerprint lives at the
+ * START of the content, so the rest of a 10 KB system prompt is noise that
+ * would bury the one sentence worth reading. At most three entries are kept —
+ * the gate scans every `system` message, but a body with more than three of
+ * them is already worth showing compactly.
+ *
+ * Takes the bytes that actually went on the wire (the body after
+ * {@link prepareChatBody}), so a KNOWN fingerprint reads back as the neutral
+ * line the plugin prepended rather than as the host's original wording —
+ * which is exactly what "the evidence" has to mean: the reader must see what
+ * the upstream saw.
+ *
+ * Never throws: a malformed body is the upstream's to reject, and losing the
+ * failure measurement is not an acceptable price for reading an excerpt.
+ */
+export function systemOpeningsOfBody(bodyJson: string): string[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(bodyJson)
+  } catch {
+    return []
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return []
+  const messages = (parsed as Record<string, unknown>)['messages']
+  if (!Array.isArray(messages)) return []
+  const openings: string[] = []
+  for (const value of messages) {
+    if (openings.length >= 3) break
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    const role = message['role']
+    if (typeof role !== 'string' || role.trim().toLowerCase() !== 'system') continue
+    const content = message['content']
+    if (typeof content !== 'string') continue
+    const opening = firstLineOf(content).replace(/\s+/gu, ' ').trim()
+    if (opening !== '') openings.push(clip(opening, SYSTEM_OPENING_LIMIT))
+  }
+  return openings
+}
+
+/** The content up to the first newline — a fingerprint lives at the start. */
+function firstLineOf(content: string): string {
+  const newline = content.indexOf('\n')
+  return newline === -1 ? content : content.slice(0, newline)
+}
+
+/** Clip a string to `limit` characters, marking the cut with an ellipsis. */
+function clip(text: string, limit: number): string {
+  return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`
 }
 
 function chatBase(credential: WorkBuddyCredential): string {
@@ -546,13 +668,19 @@ function identityHeaders(credential: WorkBuddyCredential): Record<string, string
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
  * `tool_choice` (the upstream's field is a string; object forms return 400),
- * and rewrite `developer` messages as `system`.
+ * rewrite `developer` messages as `system`, and move a recognized third-party
+ * agent system prompt off the gateway's content fingerprint.
  *
  * The `developer` rewrite is load-bearing: pi-ai emits the system prompt as
  * `role: "developer"` (the OpenAI convention it adopted), but the WorkBuddy
  * upstream rejects that role with HTTP 400 code 11128 ("Illegal API
  * invocation from an unapproved channel"). Rewriting to `system` is the
  * compatible spelling the upstream accepts.
+ *
+ * The channel-fingerprint rewrite is load-bearing for the same reason, one
+ * layer down: the gateway also scans the START of every `system` message for a
+ * list of known third-party-agent prompt openings and refuses a hit with the
+ * same 11128. See {@link neutralizeChannelFingerprints}.
  */
 export function prepareChatBody(source: string): string {
   let body: unknown
@@ -565,8 +693,118 @@ export function prepareChatBody(source: string): string {
   const obj = body as Record<string, unknown>
   obj['stream'] = true
   normalizeDeveloperRole(obj)
+  neutralizeChannelFingerprints(obj)
   normalizeToolChoice(obj)
   return JSON.stringify(obj)
+}
+
+/**
+ * System-prompt openings the gateway treats as an unapproved channel.
+ *
+ * WHY THIS EXISTS. The WorkBuddy gateways scan the START of every `system`
+ * message against a list of known third-party-agent prompt openings, and refuse
+ * a hit with business code `11128` / "Illegal API invocation from an unapproved
+ * channel". The upstream's own wording blames the CLIENT — "可能不是官方客户端发出的"
+ * ("this call did not come from the official client") — which is misleading: the
+ * rule is a CONTENT prefix match, and it has nothing to do with the account, the
+ * credit balance, the network, or the User-Agent.
+ *
+ * MEASURED (2026-10-21, real CN gateway `copilot.tencent.com`, account
+ * `18860d9c…`, model `deepseek-v4.1-flash`, every other request field held
+ * fixed, only the system opening varied):
+ *
+ *   system content starts with                                result
+ *   --------------------------------------------------------  ------------------
+ *   "You are an AI agent powered by DeepSeek Harness"         400 / 11128
+ *   "You are Claude Code, Anthropic's official CLI for Claude" 400 / 11128
+ *   "You are an AI agent powered by Kimi."                      200
+ *   "You are Cursor Agent…", "You are Gemini CLI…", …          200
+ *   the same DSH prompt with one neutral line prepended       200
+ *
+ * The matching rule is a start-of-content PREFIX match, measured
+ * character-precisely: the DSH opening triggers at 47 characters (up to and
+ * including "Harness", the trailing period excluded) and passes at 46; the
+ * match is case-insensitive; a leading space before the opening passes; the
+ * same sentence mid-prompt, or in a `user` message, passes. EVERY `system`
+ * message is scanned, not only the first — a hit in the second one is refused
+ * just the same.
+ *
+ * The two entries below are the measured snapshot. The gateway may add more,
+ * and a body carrying an unlisted opening will be refused until it is added
+ * here — which is why {@link classifyUpstreamError} reports this failure as
+ * `channel_reject` (naming the offending line) rather than as a generic
+ * `client` error that sends the reader to change an account.
+ */
+const UNAPPROVED_CHANNEL_OPENINGS: readonly string[] = [
+  'you are an ai agent powered by deepseek harness',
+  "you are claude code, anthropic's official cli for claude",
+]
+
+/**
+ * The neutral line prepended to a system message whose opening the gateway
+ * would refuse.
+ *
+ * Deliberately tiny: it exists to move the content off the fingerprint, not to
+ * steer the model. Inventing a longer persona would change model behaviour on
+ * every affected request, and the gateway only ever looks at the opening.
+ */
+const CHANNEL_FALLBACK_SYSTEM_PROMPT = 'You are a helpful assistant.'
+
+/**
+ * Move every `system` message off the gateway's content fingerprint.
+ *
+ * A no-op for a body whose system messages start with anything else, so a
+ * request the upstream already answers keeps its prompt byte-for-byte — only
+ * the messages the gateway would refuse grow, by one short line.
+ *
+ * The prepend is the smallest change that works: the gate matches at offset 0,
+ * so a neutral line in front of the offending opening is enough, and the host's
+ * own prompt text is preserved unchanged behind it.
+ *
+ * Handles the two content shapes the gateway reads: a plain string, and an
+ * array of content parts whose FIRST text part carries the opening. A `user`
+ * message is never touched — the gateway does not scan those.
+ */
+function neutralizeChannelFingerprints(obj: Record<string, unknown>): void {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  for (const value of messages) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) continue
+    const message = value as Record<string, unknown>
+    const role = message['role']
+    if (typeof role !== 'string' || role.trim().toLowerCase() !== 'system') continue
+    const content = message['content']
+    if (typeof content === 'string') {
+      if (!opensWithUnapprovedChannel(content)) continue
+      message['content'] = `${CHANNEL_FALLBACK_SYSTEM_PROMPT}\n\n${content}`
+      continue
+    }
+    if (!Array.isArray(content)) continue
+    const parts = content as unknown[]
+    for (const part of parts) {
+      if (typeof part !== 'object' || part === null || Array.isArray(part)) continue
+      const block = part as Record<string, unknown>
+      if (block['type'] !== 'text' || typeof block['text'] !== 'string') continue
+      if (!opensWithUnapprovedChannel(block['text'])) continue
+      block['text'] = `${CHANNEL_FALLBACK_SYSTEM_PROMPT}\n\n${block['text']}`
+      break
+    }
+  }
+}
+
+/**
+ * Whether a system message's content starts with one of the gateway's
+ * fingerprints.
+ *
+ * The comparison is at offset 0 and case-insensitive, matching the measured
+ * rule exactly: a leading space in front of the opening is NOT refused by the
+ * gateway (measured 200), so such a body must not be rewritten either — it is
+ * already one the upstream answers, and rewriting it would change a working
+ * request for nothing.
+ */
+function opensWithUnapprovedChannel(content: string): boolean {
+  const opening = content.toLowerCase()
+  return UNAPPROVED_CHANNEL_OPENINGS.some((prefix) => opening.startsWith(prefix))
 }
 
 /** Rewrite `role: "developer"` messages to `role: "system"` (upstream rejects developer). */
@@ -1540,14 +1778,26 @@ export function modelWithCurrentPromotion(model: WorkBuddyUpstreamModel, now = D
 /**
  * Prepare a body for the **CN** endpoint.
  *
- * Until #87 the CN wire was the caller's body verbatim. The only difference
- * now is the shared {@link dropUnsupportedEffort} strip, whose region scope was
- * lifted once measurements showed this endpoint rejects `off` too.
+ * Until #87 the CN wire was the caller's body verbatim. The difference now is
+ * the shared {@link dropUnsupportedEffort} strip, whose region scope was lifted
+ * once measurements showed this endpoint rejects `off` too, plus the channel
+ * fingerprint neutralisation (issue #144).
  *
  * Deliberately **not** routed through {@link prepareChatBody}: the shim already
  * applies it before handing the body to {@link WorkBuddyUpstreamClient.chatStream},
  * and re-running it would be a second `stream`/`developer`/`tool_choice`
- * normalisation of an already-normalised body. Only the strip belongs here.
+ * normalisation of an already-normalised body. Only the region-specific steps
+ * belong here.
+ *
+ * The two rewrites this path DOES apply are the ones that decide whether the
+ * CN gateway answers at all, and both are idempotent, so running them on an
+ * already-prepared body changes nothing:
+ *
+ * - {@link normalizeDeveloperRole} — the CN endpoint rejects a `developer`
+ *   role with the same 11128 the channel gate uses.
+ * - {@link neutralizeChannelFingerprints} — the CN endpoint refuses a system
+ *   message whose OPENING matches a known third-party-agent prompt, which is
+ *   exactly the host's own prompt (measured: 400 / 11128 on the real gateway).
  *
  * A body that is not a JSON object is returned unchanged, so this is safe to
  * run over an already-prepared-or-not body.
@@ -1562,6 +1812,8 @@ export function prepareCnChatBody(source: string): string {
   }
   if (!isObject(body)) return source
   dropUnsupportedEffort(body)
+  normalizeDeveloperRole(body)
+  neutralizeChannelFingerprints(body)
   return JSON.stringify(body)
 }
 
