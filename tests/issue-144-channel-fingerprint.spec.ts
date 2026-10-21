@@ -29,14 +29,22 @@ import {
  * varied:
  *
  *   - the DSH opening → 400 / 11128
- *   - the same prompt with one neutral line in front → 200
+ *   - the same prompt with the official opening in front → 200
  *   - the Claude Code opening → 400 / 11128
  *   - every other agent opening tried (Kimi, Cursor, Gemini CLI, Cline,
  *     Aider, Codex, opencode, Copilot, Trae, Qwen Code, windsurf, Roo Code)
  *     → 200
  *
  * The rule is a prefix match at offset 0, case-insensitive, and it scans
- * EVERY `system` message rather than only the first.
+ * EVERY `system` message rather than only the first. It is a BLACKLIST, not an
+ * allowlist — "Hello.", "asdf", "x" and "You are ChatGPT." are all accepted.
+ *
+ * The line the plugin prepends is the OFFICIAL client's own agent-prompt
+ * opening, read out of the installed WorkBuddy desktop app
+ * (`resources/app.asar.unpacked/cli/product.json`, template `cli-agent-prompt`):
+ * "You are CodeBuddy Code." Only that one line is borrowed — the rest of the
+ * official prompt carries its own tool conventions and content policy, which
+ * would displace the host's.
  */
 
 /** The host prompt the gateway refuses, exactly as DSH emits it. */
@@ -45,8 +53,8 @@ const DSH_OPENING = 'You are an AI agent powered by DeepSeek Harness.'
 /** The other measured fingerprint (pi-ai's Anthropic default). */
 const CLAUDE_OPENING = "You are Claude Code, Anthropic's official CLI for Claude."
 
-/** The neutral line the fix prepends. */
-const NEUTRAL = 'You are a helpful assistant.'
+/** The official client's own agent-prompt opening — the line the fix prepends. */
+const OFFICIAL = 'You are CodeBuddy Code.'
 
 /** The refusals the plugin must neutralise. */
 const REFUSED_OPENINGS = [DSH_OPENING, CLAUDE_OPENING]
@@ -69,14 +77,14 @@ function systemMessages(bodyJson: string): { role: string, content: unknown }[] 
 }
 
 describe('the channel fingerprint is neutralised', () => {
-  it.each(REFUSED_OPENINGS)('prepends a neutral line to a system message opening with %j', (opening) => {
+  it.each(REFUSED_OPENINGS)('prepends the official opening to a system message opening with %j', (opening) => {
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       model: 'deepseek-v4.1-flash',
       messages: [{ role: 'system', content: opening }, { role: 'user', content: 'hi' }],
     }))) as { messages: { role: string, content: string }[] }
     const system = body.messages[0]!
-    expect(system.content).toBe(`${NEUTRAL}\n\n${opening}`)
-    // The host's own wording is preserved behind the neutral line.
+    expect(system.content).toBe(`${OFFICIAL}\n\n${opening}`)
+    // The host's own wording is preserved behind the prepended line.
     expect(system.content).toContain(opening)
   })
 
@@ -92,9 +100,9 @@ describe('the channel fingerprint is neutralised', () => {
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       messages: [{ role: 'system', content: prompt }, { role: 'user', content: 'hi' }],
     }))) as { messages: { content: string }[] }
-    // The neutral line is in front, so the content no longer OPENS with the
+    // The official opening is in front, so the content no longer OPENS with the
     // fingerprint — which is the only thing the gateway looks at.
-    expect(body.messages[0]!.content.startsWith(NEUTRAL)).toBe(true)
+    expect(body.messages[0]!.content.startsWith(OFFICIAL)).toBe(true)
     expect(body.messages[0]!.content).toContain('DeepSeek Harness Web GUI')
   })
 
@@ -103,12 +111,12 @@ describe('the channel fingerprint is neutralised', () => {
     // one is refused just the same.
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       messages: [
-        { role: 'system', content: NEUTRAL },
+        { role: 'system', content: 'You are a helpful assistant.' },
         { role: 'system', content: DSH_OPENING },
         { role: 'user', content: 'hi' },
       ],
     }))) as { messages: { content: string }[] }
-    expect(body.messages[1]!.content).toBe(`${NEUTRAL}\n\n${DSH_OPENING}`)
+    expect(body.messages[1]!.content).toBe(`${OFFICIAL}\n\n${DSH_OPENING}`)
   })
 
   it('neutralises a `developer` message, because it becomes a `system` one first', () => {
@@ -119,7 +127,7 @@ describe('the channel fingerprint is neutralised', () => {
       messages: [{ role: 'developer', content: DSH_OPENING }, { role: 'user', content: 'hi' }],
     }))) as { messages: { role: string, content: string }[] }
     expect(body.messages[0]!.role).toBe('system')
-    expect(body.messages[0]!.content).toBe(`${NEUTRAL}\n\n${DSH_OPENING}`)
+    expect(body.messages[0]!.content).toBe(`${OFFICIAL}\n\n${DSH_OPENING}`)
   })
 
   it('neutralises a system message whose content is an array of parts', () => {
@@ -131,7 +139,7 @@ describe('the channel fingerprint is neutralised', () => {
         { role: 'user', content: 'hi' },
       ],
     }))) as { messages: { content: { type: string, text: string }[] }[] }
-    expect(body.messages[0]!.content[0]!.text).toBe(`${NEUTRAL}\n\n${DSH_OPENING}`)
+    expect(body.messages[0]!.content[0]!.text).toBe(`${OFFICIAL}\n\n${DSH_OPENING}`)
   })
 
   it('matches case-insensitively, as the gateway does', () => {
@@ -139,7 +147,7 @@ describe('the channel fingerprint is neutralised', () => {
     const body = JSON.parse(prepareChatBody(JSON.stringify({
       messages: [{ role: 'system', content: 'you are an ai agent powered by deepseek harness.' }],
     }))) as { messages: { content: string }[] }
-    expect(body.messages[0]!.content.startsWith(NEUTRAL)).toBe(true)
+    expect(body.messages[0]!.content.startsWith(OFFICIAL)).toBe(true)
   })
 })
 
@@ -163,7 +171,7 @@ describe('the neutralisation changes nothing else', () => {
     // Measured: the same sentence inside a user message is accepted.
     const content = `${DSH_OPENING}\n\nhi`
     const body = JSON.parse(prepareChatBody(JSON.stringify({
-      messages: [{ role: 'system', content: NEUTRAL }, { role: 'user', content }],
+      messages: [{ role: 'system', content: 'You are a helpful assistant.' }, { role: 'user', content }],
     }))) as { messages: { role: string, content: string }[] }
     expect(body.messages[1]!.content).toBe(content)
   })
@@ -209,7 +217,7 @@ describe('both region paths neutralise the fingerprint', () => {
       model: 'deepseek-v4.1-flash',
       messages: [{ role: 'system', content: DSH_OPENING }, { role: 'user', content: 'hi' }],
     }))) as { messages: { content: string }[] }
-    expect(body.messages[0]!.content.startsWith(NEUTRAL)).toBe(true)
+    expect(body.messages[0]!.content.startsWith(OFFICIAL)).toBe(true)
   })
 
   it.each(REGIONS)('%s keeps an allowed opening untouched', (_label, prepare) => {
@@ -267,20 +275,20 @@ describe('systemOpeningsOfBody reports the evidence', () => {
   it('takes the first line of each system message', () => {
     const openings = systemOpeningsOfBody(JSON.stringify({
       messages: [
-        { role: 'system', content: `${NEUTRAL}\n\n${DSH_OPENING}` },
+        { role: 'system', content: `${OFFICIAL}\n\n${DSH_OPENING}` },
         { role: 'user', content: 'hi' },
       ],
     }))
-    expect(openings).toEqual([NEUTRAL])
+    expect(openings).toEqual([OFFICIAL])
   })
 
   it('reports the bytes that actually went on the wire', () => {
-    // A known fingerprint reads back as the neutral line the plugin prepended
-    // — that IS what the upstream saw, and it is the evidence.
+    // A known fingerprint reads back as the official opening the plugin
+    // prepended — that IS what the upstream saw, and it is the evidence.
     const prepared = prepareChatBody(JSON.stringify({
       messages: [{ role: 'system', content: DSH_OPENING }],
     }))
-    expect(systemOpeningsOfBody(prepared)).toEqual([NEUTRAL])
+    expect(systemOpeningsOfBody(prepared)).toEqual([OFFICIAL])
   })
 
   it('keeps at most three openings', () => {
